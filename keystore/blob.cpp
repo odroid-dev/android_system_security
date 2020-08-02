@@ -19,12 +19,12 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <openssl/rand.h>
 #include <string.h>
 
 #include <cutils/log.h>
 
 #include "blob.h"
+#include "entropy.h"
 
 #include "keystore_utils.h"
 
@@ -60,31 +60,16 @@ class ArrayEraser {
     size_t mSize;
 };
 
-/**
- * Returns a EVP_CIPHER appropriate for the given key, based on the key's size.
- */
-const EVP_CIPHER* getAesCipherForKey(const std::vector<uint8_t>& key) {
-    const EVP_CIPHER* cipher = EVP_aes_256_gcm();
-    if (key.size() == kAes128KeySizeBytes) {
-        cipher = EVP_aes_128_gcm();
-    }
-    return cipher;
-}
-
 /*
- * Encrypt 'len' data at 'in' with AES-GCM, using 128-bit or 256-bit key at 'key', 96-bit IV at
- * 'iv' and write output to 'out' (which may be the same location as 'in') and 128-bit tag to
- * 'tag'.
+ * Encrypt 'len' data at 'in' with AES-GCM, using 128-bit key at 'key', 96-bit IV at 'iv' and write
+ * output to 'out' (which may be the same location as 'in') and 128-bit tag to 'tag'.
  */
-ResponseCode AES_gcm_encrypt(const uint8_t* in, uint8_t* out, size_t len,
-                             const std::vector<uint8_t>& key, const uint8_t* iv, uint8_t* tag) {
-
-    // There can be 128-bit and 256-bit keys
-    const EVP_CIPHER* cipher = getAesCipherForKey(key);
-
+ResponseCode AES_gcm_encrypt(const uint8_t* in, uint8_t* out, size_t len, const uint8_t* key,
+                             const uint8_t* iv, uint8_t* tag) {
+    const EVP_CIPHER* cipher = EVP_aes_128_gcm();
     EVP_CIPHER_CTX_Ptr ctx(EVP_CIPHER_CTX_new());
 
-    EVP_EncryptInit_ex(ctx.get(), cipher, nullptr /* engine */, key.data(), iv);
+    EVP_EncryptInit_ex(ctx.get(), cipher, nullptr /* engine */, key, iv);
     EVP_CIPHER_CTX_set_padding(ctx.get(), 0 /* no padding needed with GCM */);
 
     std::unique_ptr<uint8_t[]> out_tmp(new uint8_t[len]);
@@ -108,20 +93,15 @@ ResponseCode AES_gcm_encrypt(const uint8_t* in, uint8_t* out, size_t len,
 }
 
 /*
- * Decrypt 'len' data at 'in' with AES-GCM, using 128-bit or 256-bit key at 'key', 96-bit IV at
- * 'iv', checking 128-bit tag at 'tag' and writing plaintext to 'out'(which may be the same
- * location as 'in').
+ * Decrypt 'len' data at 'in' with AES-GCM, using 128-bit key at 'key', 96-bit IV at 'iv', checking
+ * 128-bit tag at 'tag' and writing plaintext to 'out' (which may be the same location as 'in').
  */
-ResponseCode AES_gcm_decrypt(const uint8_t* in, uint8_t* out, size_t len,
-                             const std::vector<uint8_t> key, const uint8_t* iv,
-                             const uint8_t* tag) {
-
-    // There can be 128-bit and 256-bit keys
-    const EVP_CIPHER* cipher = getAesCipherForKey(key);
-
+ResponseCode AES_gcm_decrypt(const uint8_t* in, uint8_t* out, size_t len, const uint8_t* key,
+                             const uint8_t* iv, const uint8_t* tag) {
+    const EVP_CIPHER* cipher = EVP_aes_128_gcm();
     EVP_CIPHER_CTX_Ptr ctx(EVP_CIPHER_CTX_new());
 
-    EVP_DecryptInit_ex(ctx.get(), cipher, nullptr /* engine */, key.data(), iv);
+    EVP_DecryptInit_ex(ctx.get(), cipher, nullptr /* engine */, key, iv);
     EVP_CIPHER_CTX_set_padding(ctx.get(), 0 /* no padding needed with GCM */);
     EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_TAG, kGcmTagLength, const_cast<uint8_t*>(tag));
 
@@ -225,8 +205,8 @@ void Blob::setFallback(bool fallback) {
     }
 }
 
-ResponseCode Blob::writeBlob(const std::string& filename, const std::vector<uint8_t>& aes_key,
-                             State state) {
+ResponseCode Blob::writeBlob(const std::string& filename, const uint8_t* aes_key, State state,
+                             Entropy* entropy) {
     ALOGV("writing blob %s", filename.c_str());
 
     const size_t dataLength = mBlob.length;
@@ -239,7 +219,7 @@ ResponseCode Blob::writeBlob(const std::string& filename, const std::vector<uint
         }
 
         memset(mBlob.initialization_vector, 0, AES_BLOCK_SIZE);
-        if (!RAND_bytes(mBlob.initialization_vector, kGcmIvSizeBytes)) {
+        if (!entropy->generate_random_data(mBlob.initialization_vector, kGcmIvSizeBytes)) {
             ALOGW("Could not read random data for: %s", filename.c_str());
             return ResponseCode::SYSTEM_ERROR;
         }
@@ -275,8 +255,7 @@ ResponseCode Blob::writeBlob(const std::string& filename, const std::vector<uint
     return ResponseCode::NO_ERROR;
 }
 
-ResponseCode Blob::readBlob(const std::string& filename, const std::vector<uint8_t>& aes_key,
-                            State state) {
+ResponseCode Blob::readBlob(const std::string& filename, const uint8_t* aes_key, State state) {
     ALOGV("reading blob %s", filename.c_str());
     const int in = TEMP_FAILURE_RETRY(open(filename.c_str(), O_RDONLY));
     if (in < 0) {
@@ -320,7 +299,7 @@ ResponseCode Blob::readBlob(const std::string& filename, const std::vector<uint8
             }
 
             AES_KEY key;
-            AES_set_decrypt_key(aes_key.data(), kAesKeySize * 8, &key);
+            AES_set_decrypt_key(aes_key, kAesKeySize * 8, &key);
             AES_cbc_encrypt(blob.encrypted, blob.encrypted, encryptedLength, &key, blob.vector,
                             AES_DECRYPT);
             key = {};  // clear key

@@ -1355,34 +1355,23 @@ Status KeyStoreService::begin(const sp<IBinder>& appToken, const String16& name,
         result->outParams = outParams;
     };
 
-    KeyStoreServiceReturnCode rc =
+    ErrorCode rc =
         KS_HANDLE_HIDL_ERROR(dev->begin(keyPurpose, key, opParams.hidl_data(), authToken, hidlCb));
-    if (!rc.isOk()) {
-        LOG(ERROR) << "Got error " << rc << " from begin()";
-        result->resultCode = ResponseCode::SYSTEM_ERROR;
-        return Status::ok();
+    if (rc != ErrorCode::OK) {
+        ALOGW("Got error %d from begin()", rc);
     }
-
-    rc = result->resultCode;
 
     // If there are too many operations abort the oldest operation that was
     // started as pruneable and try again.
-    LOG(INFO) << rc << " " << mOperationMap.hasPruneableOperation();
     while (rc == ErrorCode::TOO_MANY_OPERATIONS && mOperationMap.hasPruneableOperation()) {
-        LOG(INFO) << "Ran out of operation handles";
+        ALOGW("Ran out of operation handles");
         if (!pruneOperation()) {
             break;
         }
         rc = KS_HANDLE_HIDL_ERROR(
             dev->begin(keyPurpose, key, opParams.hidl_data(), authToken, hidlCb));
-        if (!rc.isOk()) {
-            LOG(ERROR) << "Got error " << rc << " from begin()";
-            result->resultCode = ResponseCode::SYSTEM_ERROR;
-            return Status::ok();
-        }
-        rc = result->resultCode;
     }
-    if (!rc.isOk()) {
+    if (rc != ErrorCode::OK) {
         result->resultCode = rc;
         return Status::ok();
     }
@@ -1401,12 +1390,12 @@ Status KeyStoreService::begin(const sp<IBinder>& appToken, const String16& name,
                                                                 verificationToken = token;
                                                             }));
 
-        if (!rc.isOk()) result->resultCode = rc;
-        if (!result->resultCode.isOk()) {
-            LOG(ERROR) << "Failed to verify authorization " << rc << " from begin()";
+        if (rc != ErrorCode::OK) result->resultCode = rc;
+        if (result->resultCode != ErrorCode::OK) {
+            ALOGW("Failed to verify authorization %d from begin()", rc);
             rc = KS_HANDLE_HIDL_ERROR(dev->abort(result->handle));
-            if (!rc.isOk()) {
-                LOG(ERROR) << "Failed to abort operation " << rc << " from begin()";
+            if (rc != ErrorCode::OK) {
+                ALOGW("Failed to abort operation %d from begin()", rc);
             }
             return Status::ok();
         }
@@ -1758,9 +1747,11 @@ KeyStoreService::attestDeviceIds(const KeymasterArguments& params,
     }
 
     // Generate temporary key.
-    sp<Keymaster> dev = mKeyStore->getDevice(SecurityLevel::TRUSTED_ENVIRONMENT);
+    sp<Keymaster> dev;
+    SecurityLevel securityLevel;
+    std::tie(dev, securityLevel) = mKeyStore->getMostSecureDevice();
 
-    if (!dev) {
+    if (securityLevel == SecurityLevel::SOFTWARE) {
         *aidl_return = static_cast<int32_t>(ResponseCode::SYSTEM_ERROR);
         return Status::ok();
     }
@@ -2353,15 +2344,24 @@ KeyStoreServiceReturnCode KeyStoreService::upgradeKeyBlob(const String16& name, 
 }
 
 Status KeyStoreService::onKeyguardVisibilityChanged(bool isShowing, int32_t userId,
-                                                    int32_t* aidl_return) {
+                                                    int32_t* _aidl_return) {
     KEYSTORE_SERVICE_LOCK;
-    enforcement_policy.set_device_locked(isShowing, userId);
-    if (!isShowing) {
+    if (isShowing) {
+        if (!checkBinderPermission(P_LOCK, UID_SELF)) {
+            LOG(WARNING) << "onKeyguardVisibilityChanged called with isShowing == true but "
+                            "without LOCK permission";
+            return AIDL_RETURN(ResponseCode::PERMISSION_DENIED);
+        }
+    } else {
+        if (!checkBinderPermission(P_UNLOCK, UID_SELF)) {
+            LOG(WARNING) << "onKeyguardVisibilityChanged called with isShowing == false but "
+                            "without UNLOCK permission";
+            return AIDL_RETURN(ResponseCode::PERMISSION_DENIED);
+        }
         mActiveUserId = userId;
     }
-    *aidl_return = static_cast<int32_t>(ResponseCode::NO_ERROR);
-
-    return Status::ok();
+    enforcement_policy.set_device_locked(isShowing, userId);
+    return AIDL_RETURN(ResponseCode::NO_ERROR);
 }
 
 }  // namespace keystore
